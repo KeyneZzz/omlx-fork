@@ -6,434 +6,113 @@
   </picture>
 </p>
 
-<h1 align="center">oMLX</h1>
-<p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
+<h1 align="center">oMLX Fork:DFlash2 单会话内存优化</h1>
 
-<p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
+<p align="center"><b>基于 <a href="https://github.com/jundot/omlx">jundot/omlx</a>(0.6.3rc1,<code>146d2724</code>)的改造分支</b><br>
+面向<b>单实例、单会话驻留服务</b>场景,把 DFlash2 speculative decoding 的内存行为<br>从「随上下文增长 + 不可控瞬态」改造为 llama.cpp 式<b>启动即固定、峰值封顶</b>。</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/base--commit-146d2724-orange" alt="Base 146d2724">
 </p>
 
-<p align="center">
-  <a href="mailto:junkim.dot@gmail.com">junkim.dot@gmail.com</a> · <a href="https://omlx.ai/me">https://omlx.ai/me</a>
-</p>
+> **本仓库不是上游 oMLX 本身。** 上游项目的完整介绍(安装、功能、模型支持等)请看
+> [README.zh.origin.md](README.zh.origin.md)(上游中文原版 README,原样保留)与
+> [omlx.ai](https://omlx.ai)。本 README 只说明这个 fork 改了什么、为什么、怎么用。
 
-<p align="center">
-  <a href="#install">Install</a> ·
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#features">Features</a> ·
-  <a href="#models">Models</a> ·
-  <a href="#cli-configuration">CLI Configuration</a> ·
-  <a href="https://omlx.ai/benchmarks">Benchmarks</a> ·
-  <a href="https://omlx.ai">oMLX.ai</a>
-</p>
+## 解决什么问题
 
-<p align="center">
-  <b>English</b> ·
-  <a href="README.zh.md">中文</a> ·
-  <a href="README.ko.md">한국어</a> ·
-  <a href="README.ja.md">日本語</a>
-</p>
+上游 DFlash2 引擎在长上下文单会话场景下,内存由三部分不可控成分主导:
 
----
+| 成分 | 机理 | 位置 |
+|---|---|---|
+| KV 增长拷贝 | `KVCache.update_and_fetch` 容量不足时 `mx.concatenate`,旧 + 新 + 结果三份数组共存,释放后滞留分配器池 | `mlx_lm/models/cache.py` |
+| 分数物化 | head_dim=256 无融合 SDPA,每 chunk 每层物化 `[24, chunk, ctx]` 分数矩阵 | `dflash_mlx` 分发逻辑 |
+| 池滞留 | 释放的缓冲滞留 MLX 缓存池,footprint 不回落 | turn 边界实测 +9.4GB |
 
-<p align="center">
-  <img src="docs/images/omlx_dashboard.png" alt="oMLX Admin Dashboard" width="800">
-</p>
+实测(Mac M4 Pro 48GB,Qwen3.8-27B-4bit):100K ctx 时稳态之上仍有 **+15GB 瞬态**,真峰值 42.6GB,稳定可用上下文只有 ~100K,并且随时可能触发卸载。
 
-> *Every LLM server I tried made me choose between convenience and control. I wanted to pin everyday models in memory, auto-swap heavier ones on demand, set context limits - and manage it all from a menu bar.*
->
-> *oMLX persists KV cache across a hot in-memory tier and cold SSD tier - even when context changes mid-conversation, all past context stays cached and reusable across requests, making local LLMs practical for real coding work with tools like Claude Code. That's why I built it.*
+## 改动内容
 
-## Install
-
-### macOS App
-
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
-
-### Homebrew
-
-```bash
-brew tap jundot/omlx https://github.com/jundot/omlx
-brew install jundot/omlx/omlx
-
-# Upgrade to the latest version
-brew update && brew upgrade omlx
-
-# Run as a background service (auto-restarts on crash)
-omlx start
-
-# Optional: MCP (Model Context Protocol) support
-/opt/homebrew/opt/omlx/libexec/bin/pip install mcp
-```
-
-Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
-
-```bash
-brew install jundot/omlx/omlx --HEAD --with-custom-kernel
-```
-
-### From Source
-
-```bash
-git clone https://github.com/jundot/omlx.git
-cd omlx
-pip install -e .          # Core only
-pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
-
-# GLM-5.2 / MiniMax M3 / Qwen3.5 native custom kernels (strongly recommended
-# if you serve those families -- see note below)
-OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
-```
-
-Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4).
-
-> **Note on native custom kernels:** a plain `pip install -e .` does NOT build
-> them, and the affected model families then silently fall back to much slower
-> generic paths -- for GLM-5.2 the fused DSA prefill is roughly 30x faster with
-> the kernels (measured 845 vs ~29 tok/s on an M3 Ultra), and the fallback also
-> uses more memory (#2137). Building them requires the Metal toolchain, which
-> Command Line Tools alone do not provide (`xcrun: error: unable to find utility
-> "metal"`): install full Xcode, or use the official DMG which ships the kernels
-> precompiled. Homebrew can build them with `brew install jundot/omlx/omlx --HEAD
-> --with-custom-kernel`, but that build also needs full Xcode. To verify your
-> install:
->
-> ```bash
-> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
-> ```
-
-## Quickstart
-
-### macOS App
-
-Launch oMLX from your Applications folder. The Welcome screen guides you through three steps - model directory, server start, and first model download. That's it. To connect OpenClaw, OpenCode, Codex, Hermes Agent, or Copilot, see [Integrations](#integrations).
-
-<p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX Welcome Screen" width="360">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.34.30.png" alt="oMLX Menubar" width="240">
-</p>
-
-### CLI
-
-```bash
-# Managed background server (macOS app or Homebrew install)
-omlx start
-omlx stop
-omlx restart
-
-# Foreground server attached to this terminal
-omlx serve --model-dir ~/models
-```
-
-The server discovers LLMs, VLMs, embedding models, and rerankers from subdirectories automatically. Any OpenAI-compatible client can connect to `http://localhost:8000/v1`. A built-in chat UI is also available at `http://localhost:8000/admin/chat`.
-
-### Homebrew Service
-
-If you installed via Homebrew, you can run oMLX as a managed background service:
-
-```bash
-omlx start                    # Start via brew services
-omlx stop                     # Stop
-omlx restart                  # Restart
-
-brew services start omlx    # Start (auto-restarts on crash)
-brew services stop omlx     # Stop
-brew services restart omlx  # Restart
-brew services info omlx     # Check status
-```
-
-The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). `omlx start`, `omlx stop`, and `omlx restart` are the portable lifecycle commands; Homebrew installs delegate them to `brew services`. To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
-
-Logs are written to two locations:
-- **Service log**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
-- **Server log**: `~/.omlx/logs/server.log` (structured application log)
-
-## Features
-
-Supports text LLMs, vision-language models (VLM), OCR models, embeddings, and rerankers on Apple Silicon.
-
-### Admin Dashboard
-
-Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, Chinese, French, Russian, Spanish, and Brazilian Portuguese. All CDN dependencies are vendored for fully offline operation.
-
-<p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
-</p>
-
-### Experimental Multi-Mac Inference
-
-Source builds can split one downloaded language model across unequal-memory Macs
-using MLX pipeline ranks over Ring or Thunderbolt RDMA/JACCL. The Cluster
-dashboard handles read-only peer discovery, strict SSH/runtime verification,
-byte-aware unequal shard planning, measured compute/link rebalancing,
-headroom-aware execution tuning, activation, and a live shard/performance map
-on both Macs. Interactive, balanced, and throughput profiles expose coalesced
-batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
-and a capability-gated experimental token-only output path. See
-[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
-security boundaries, current limitations, and the physical-hardware validation
-checklist.
-
-### Vision-Language Models
-
-Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
-
-### Tiered KV Cache (Hot + Cold)
-
-Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-on-Write. The cache operates across two tiers:
-
-- **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
-- **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
-
-<p align="center">
-  <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
-</p>
-
-### Continuous Batching
-
-Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
-
-### Claude Code Optimization
-
-Context scaling support for running smaller context models with Claude Code. Scales reported token counts so that auto-compact triggers at the right timing, and SSE keep-alive prevents read timeouts during long prefill.
-
-### Multi-Model Serving
-
-Load LLMs, VLMs, embedding models, and rerankers within the same server. Models are managed through a combination of automatic and manual controls:
-
-- **LRU eviction**: Least-recently-used models are evicted automatically when memory runs low.
-- **Manual load/unload**: Interactive status badges in the admin panel let you load or unload models on demand.
-- **Model pinning**: Pin frequently used models to keep them always loaded.
-- **Per-model TTL**: Set an idle timeout per model to auto-unload after a period of inactivity.
-- **Process memory enforcement**: Total memory limit (default: system RAM - 8GB) prevents system-wide OOM.
-
-### Per-Model Settings
-
-Configure sampling parameters, chat template kwargs, TTL, model alias, model type override, and more per model directly from the admin panel. Changes apply immediately without server restart.
-
-- **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
-- **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
-- **Profiles**: save named bundles of per-model settings and switch between them from the admin panel. A profile can optionally be exposed as its own model: `/v1/models` then also lists `<model>:<profile>` (e.g. `qwen3-8b:thinking`), which serves on the same engine as the base model with the profile's settings overlaid per request — no extra memory, no reload. When the base model has an alias, the exposed ID is advertised as `<alias>:<profile>`; the directory-name form keeps working, just like for the base model.
-
-<p align="center">
-  <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
-</p>
-
-### Built-in Chat
-
-Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
-
-<p align="center">
-  <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
-</p>
-
-
-### Model Downloader
-
-Search and download MLX models from HuggingFace directly in the admin dashboard. Browse model cards, check file sizes, and download with one click.
-
-<p align="center">
-  <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">
-</p>
-
-### Integrations
-
-Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, and Pi directly from the admin dashboard with a single click. No manual config editing required.
-
-<p align="center">
-  <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
-</p>
-
-### Performance Benchmark
-
-One-click benchmarking from the admin panel. Measures prefill (PP) and text generation (TG) tokens per second, with partial prefix cache hit testing for realistic performance numbers.
-
-<p align="center">
-  <img src="docs/images/benchmark_omlx.png" alt="oMLX Benchmark Tool" width="720">
-</p>
-
-### macOS Menubar App
-
-Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and built-in auto-update.
-
-<p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
-</p>
-
-### API Compatibility
-
-Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), Anthropic adaptive thinking, and vision inputs (base64, URL).
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /v1/chat/completions` | Chat completions (streaming) |
-| `POST /v1/completions` | Text completions (streaming) |
-| `POST /v1/messages` | Anthropic Messages API |
-| `POST /v1/embeddings` | Text embeddings |
-| `POST /v1/rerank` | Document reranking |
-| `GET /v1/models` | List available models |
-
-### Tool Calling & Structured Output
-
-Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected via mlx-lm's built-in tool parsers:
-
-| Model Family | Format |
+| 模块 | 说明 |
 |---|---|
-| Llama, Qwen, DeepSeek, etc. | JSON `<tool_call>` |
-| Qwen3.5 Series | XML `<function=...>` |
-| Gemma | `<start_function_call>` |
-| GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
-| MiniMax | Namespaced `<minimax:tool_call>` |
-| Mistral | `[TOOL_CALLS]` |
-| Kimi K2 | `<\|tool_calls_section_begin\|>` |
-| Longcat | `<longcat_tool_call>` |
+| `omlx/patches/dflash_kv_prealloc.py`(新) | **KV 容量预分配**:运行时 monkeypatch `mlx_lm` 的 `KVCache`、dflash codecs 与 draft cache,首次使用即按 token 容量一次性分配,消除增长拷贝与池滞留。不改动 app 内 `dflash_mlx` 代码 |
+| `omlx/patches/dflash_session_base.py`(新) | **跨会话系统前缀复用**:预热「系统提示 + 工具定义」精确边界快照,新会话从基点续 prefill 而非全量重算。仅 capacity 模式生效 |
+| `omlx/engine/dflash.py` | capacity 模式接线;快照按物理容量记账(所有快照别名同一物理缓冲,账面开销不占真实内存);session base 预热/服务;load/evict 时安装与卸载补丁 |
+| `omlx/server.py` | 采样参数先于 preflight 计算,`preflight_completion` 携带 `max_tokens`,内存预检把生成 token 也计入 |
+| `omlx/scheduler.py` | 更激进的 `mx.clear_cache()`:间隔 512 → 16 步;清理预留 `limit/3`(≥2GB)→ `limit/16`(≥1GB) |
+| `omlx/model_settings.py` / `model_profiles.py` | 新增 5 个 `dflash_*` 运维旋钮,有意不暴露给 profiles / admin UI(见下表) |
 
-Models not listed above may still work if their chat template accepts `tools` and their output uses a recognized `<tool_call>` XML format. For tool-enabled streaming, assistant text is emitted incrementally while known tool-call control markup is suppressed from visible content; structured tool calls are emitted after parsing the completed turn.
+## 实测效果
 
-## Models
+Mac M4 Pro 48GB(macOS,`iogpu.wired_limit_mb=40000`,GPU 上限 ≈39.06GB),Qwen3.8-27B-4bit(MLX 4bit)+ Qwen3.8-27B-DFlash2 draft:
 
-Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported.
+- 内存行为:~~随 ctx 增长 + 不可控瞬态~~ → **启动即固定底座 ~26GB,运行中窄带波动,峰值封顶 ~35GB**
+- 稳定可用上下文:~100K → **160K(163840 tokens)**
+- 全程零卸载
 
+完整数据与推导见 [docs/dflash-single-session-memory.md](docs/dflash-single-session-memory.md)。
+
+## 使用
+
+### 配置(`~/.omlx/model_settings.json`,按模型条目)
+
+```json
+{
+  "dflash_enabled": true,
+  "dflash_draft_model": "/Users/<you>/.omlx/models/Qwen3.8-27B-DFlash2",
+  "dflash_draft_quant_enabled": true,
+  "dflash_draft_quant_weight_bits": 4,
+  "dflash_draft_quant_group_size": 64,
+  "dflash_kv_capacity_tokens": 163840,
+  "dflash_prefill_step_size": 512
+}
 ```
-~/models/
-├── Step-3.5-Flash-8bit/
-├── Qwen3-Coder-Next-8bit/
-├── gpt-oss-120b-MXFP4-Q8/
-├── Qwen3.5-122B-A10B-4bit/
-└── bge-m3/
-```
 
-Models are auto-detected by type. You can also download models directly from the admin dashboard.
+### 新增设置项
 
-| Type | Models |
-|------|--------|
-| LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
-| VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
-| OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
-| Embedding | BERT, BGE-M3, ModernBERT |
-| Reranker | ModernBERT, XLM-RoBERTa |
+| 设置 | 默认 | 说明 |
+|---|---|---|
+| `dflash_kv_capacity_tokens` | `0` | 固定 KV 容量(token)。`0` = 原生增量增长,行为同上游 |
+| `dflash_prefill_step_size` | `None` | DFlash prefill chunk 大小覆盖(`None` = dflash 默认) |
+| `dflash_max_snapshot_tokens` | `None` | 前缀快照 token 上限(`None` = dflash 默认;`0` 禁用) |
+| `dflash_session_base_reuse` | `True` | 跨会话复用共享系统前缀(仅 capacity 模式) |
+| `dflash_session_base_min_tokens` | `1024` | 触发 session base 预热/服务的最小前缀长度,更短的直接重 prefill |
 
-## CLI Configuration
+容量档位参考:**48GB 机器 → 163840;36GB → 98304 起步**。`iogpu.wired_limit_mb` 无需手工设置——omlx 启动时会自动抬到内核允许上限并在日志给出建议值,但机器内存需要与容量档位匹配。
+
+安装/构建方式与上游一致,见 [README.zh.origin.md](README.zh.origin.md) 的安装章节。
+
+## 兼容性与升级注意
+
+- 补丁以反射定位 `dflash_mlx` 内部符号;`dflash-mlx` 已 pin 到
+  [`jundot/dflash-mlx@b7f6255`](https://github.com/jundot/dflash-mlx)(v0.1.10+omlx.6)。
+- 升级任何依赖(尤其 dflash-mlx / mlx-lm / mlx)后,必须先跑 `tests/`(38+ 单测)
+  并做一轮长上下文爬坡冒烟,再放行。
+- 与上游 DFlash2 新版本的合并流程,见 [docs/upstream-dflash2-merge-runbook.md](docs/upstream-dflash2-merge-runbook.md)
+  (包括 capacity 关闭/开启双模式冒烟、`min_p`/`seed` 参数在 `b7f6255` 的行为核对等)。
+
+## 文档
+
+- [docs/dflash-single-session-memory.md](docs/dflash-single-session-memory.md) — 技术总结与使用指导(根因、10 轮 bench 证据、调参指导)
+- [docs/kv-prealloc-plan.md](docs/kv-prealloc-plan.md) — Phase 2 实现计划(设计推导)
+- [docs/upstream-dflash2-merge-runbook.md](docs/upstream-dflash2-merge-runbook.md) — 上游 DFlash2 合并 runbook
+
+## 测试
 
 ```bash
-# Managed background server (macOS app or Homebrew install)
-omlx start
-omlx stop
-omlx restart
-
-# Start with default settings (memory guard tier = balanced, manage via admin UI)
-omlx serve --model-dir ~/models
-
-# Choose a memory guard tier at startup
-omlx serve --model-dir ~/models --memory-guard safe
-
-# Set a custom memory guard ceiling in GB
-omlx serve --model-dir ~/models --memory-guard-gb 48
-
-# Enable SSD cache for KV blocks
-omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
-
-# Set in-memory hot cache size
-omlx serve --model-dir ~/models --hot-cache-max-size 20%
-
-# Adjust max concurrent requests (default: 8)
-omlx serve --model-dir ~/models --max-concurrent-requests 16
-
-# With MCP tools
-omlx serve --model-dir ~/models --mcp-config mcp.json
-
-# HuggingFace mirror endpoint (for restricted regions)
-omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
-
-# API key authentication
-omlx serve --model-dir ~/models --api-key your-secret-key
-# Localhost-only: skip verification via admin panel global settings
+pytest tests/test_dflash_kv_prealloc.py tests/test_dflash_session_base.py \
+       tests/test_dflash_engine.py tests/test_dflash_prefill_memory_guard.py
 ```
 
-All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+## 与上游的关系
 
-<details>
-<summary>Architecture</summary>
-
-```
-FastAPI Server (OpenAI / Anthropic API)
-    │
-    ├── EnginePool (multi-model, LRU eviction, TTL, manual load/unload)
-    │   ├── BatchedEngine (LLMs, continuous batching)
-    │   ├── VLMEngine (vision-language models)
-    │   ├── EmbeddingEngine
-    │   └── RerankerEngine
-    │
-    ├── ProcessMemoryEnforcer (total memory limit, TTL checks)
-    │
-    ├── Scheduler (FCFS, configurable concurrency)
-    │   └── mlx-lm BatchGenerator
-    │
-    └── Cache Stack
-        ├── PagedCacheManager (GPU, block-based, CoW, prefix sharing)
-        ├── Hot Cache (in-memory tier, write-back)
-        └── PagedSSDCacheManager (SSD cold tier, safetensors format)
-```
-
-</details>
-
-## Development
-
-### CLI Server
-
-```bash
-git clone https://github.com/jundot/omlx.git
-cd omlx
-pip install -e ".[dev]"
-pytest -m "not slow"
-```
-
-### macOS App
-
-The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
-
-```bash
-# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + ad-hoc sign)
-apps/omlx-mac/Scripts/build.sh release
-
-# Result lands at apps/omlx-mac/build/Stage/oMLX.app
-open apps/omlx-mac/build/Stage/oMLX.app
-
-# Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
-apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-
-# Stage with optional GLM-5.2 / MiniMax M3 native custom kernels
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
-```
-
-First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.
-
-## Contributing
-
-Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for details.
-
-- Bug fixes and improvements
-- Performance optimizations
-- Documentation improvements
+- 基准提交:`146d2724`(formula: bump to 0.6.3rc1),上游全部历史(2400+ 提交)完整保留,可随时 `git diff` 对比或 rebase 新上游。
+- 上游原版中文 README 保留为 [README.zh.origin.md](README.zh.origin.md)。
+- 感谢 [@jundot](https://github.com/jundot) 的 oMLX 与 DFlash2 相关上游工作。
 
 ## License
 
-[Apache 2.0](LICENSE)
-
-## Acknowledgments
-
-- [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language model inference on Apple Silicon
-- [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX started from vllm-mlx v0.1.0 and evolved significantly with multi-model serving, tiered KV caching, VLM with full paged cache support, an admin panel, and a macOS menu bar app
-- [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
-- [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
-- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
-- [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel
-- [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
+Apache-2.0,随上游([LICENSE](LICENSE))。
