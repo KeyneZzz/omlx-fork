@@ -201,10 +201,13 @@ def test_shared_helper_uses_caller_supplied_usage_without_mlx_probe():
     monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
     set_model_info_from_model(monitor, _make_target_model())
 
-    with patch(
-        "omlx.memory_monitor.mx.get_active_memory",
-        side_effect=AssertionError("preflight must not read MLX directly"),
-    ), pytest.raises(PrefillMemoryExceededError):
+    with (
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+        pytest.raises(PrefillMemoryExceededError),
+    ):
         raise_if_prefill_exceeds(
             monitor,
             prefill_memory_guard=True,
@@ -340,14 +343,17 @@ def test_guard_hot_cache_exclusion_clamps_and_keeps_active_floor():
     assert exc.value.estimated_bytes >= int(active + peak)
 
 
-def test_guard_rejects_cached_tokens():
-    """The narrowed signature is deliberate: a DFlash prefix-cache hit
-    reconstructs KV into active memory, so accepting a hit count here would
-    under-count the prefill peak and defeat the OOM guard."""
+def test_guard_credits_live_resident_cache_tokens():
+    """DFlash can credit only the live target cache already resident in MLX.
+
+    Prefix-cache snapshot hits still pass 0 at the engine wrapper, because
+    those snapshots are reconstructed into active memory for the request.
+    """
     guard = _make_guard()
     guard._prefill_memory_guard = True
     guard._memory_hard_limit_bytes = 1
-    with pytest.raises(TypeError):
+    p1, p2 = _zero_mem()
+    with p1, p2:
         guard.preflight_or_raise(num_prompt_tokens=1000, cached_tokens=1000)
 
 
@@ -372,6 +378,8 @@ def _bare_engine() -> DFlashEngine:
     eng._in_fallback_mode = False
     eng._fallback_engine = None
     eng._prefill_guard = None
+    eng._resident_cache_tokens = 0
+    eng._kv_capacity_tokens = 0
     return eng
 
 
@@ -383,7 +391,40 @@ async def test_engine_preflight_chat_delegates_to_guard():
     await eng.preflight_chat([{"role": "user", "content": "hi"}], request_id="r1")
 
     eng._prefill_guard.preflight_or_raise.assert_called_once_with(
-        num_prompt_tokens=12345, request_id="r1"
+        num_prompt_tokens=12345, cached_tokens=0, request_id="r1"
+    )
+
+
+async def test_engine_preflight_chat_credits_live_resident_cache_tokens():
+    # Residency credit is capacity-mode only: with dflash_kv_capacity_tokens>0
+    # the resident prompt KV is reused in place by the continuation path, so
+    # only the delta is charged.
+    eng = _bare_engine()
+    eng._prefill_guard = MagicMock()
+    eng._kv_capacity_tokens = 163840
+    eng._resident_cache_tokens = 100
+    eng.count_chat_tokens = MagicMock(return_value=250)
+
+    await eng.preflight_chat([{"role": "user", "content": "hi"}], request_id="r1")
+
+    eng._prefill_guard.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=250, cached_tokens=100, request_id="r1"
+    )
+
+
+async def test_engine_preflight_chat_stock_mode_no_residency_credit():
+    # Stock DFlash (capacity off) follows upstream full-prompt accounting:
+    # snapshot hydration allocates KV during the request, so no credit.
+    eng = _bare_engine()
+    eng._prefill_guard = MagicMock()
+    eng._kv_capacity_tokens = 0
+    eng._resident_cache_tokens = 100
+    eng.count_chat_tokens = MagicMock(return_value=250)
+
+    await eng.preflight_chat([{"role": "user", "content": "hi"}], request_id="r1")
+
+    eng._prefill_guard.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=250, cached_tokens=0, request_id="r1"
     )
 
 
@@ -401,6 +442,7 @@ async def test_engine_preflight_chat_delegates_to_fallback_in_fallback_mode():
 
 async def test_engine_preflight_chat_noop_without_guard():
     eng = _bare_engine()  # _prefill_guard is None, not in fallback
+    eng.count_chat_tokens = MagicMock(return_value=1)
     with patch("omlx.engine.dflash._warn_scheduler_unreachable_once") as warn:
         await eng.preflight_chat([{"role": "user", "content": "hi"}])
     warn.assert_called_once()
@@ -415,5 +457,30 @@ async def test_engine_preflight_completion_delegates_to_guard():
     await eng.preflight_completion("hello", request_id="rc")
 
     eng._prefill_guard.preflight_or_raise.assert_called_once_with(
-        num_prompt_tokens=777, request_id="rc"
+        num_prompt_tokens=777, cached_tokens=0, request_id="rc"
     )
+
+
+def test_engine_kv_capacity_preflight_allows_exact_fit():
+    eng = _bare_engine()
+    eng._kv_capacity_tokens = 10
+
+    eng._preflight_kv_capacity_or_raise(num_prompt_tokens=8, max_tokens=2)
+
+
+def test_engine_kv_capacity_preflight_rejects_prompt_plus_generation():
+    eng = _bare_engine()
+    eng._kv_capacity_tokens = 10
+
+    with pytest.raises(PrefillMemoryExceededError) as exc:
+        eng._preflight_kv_capacity_or_raise(
+            num_prompt_tokens=8,
+            max_tokens=3,
+            request_id="r-cap",
+        )
+
+    err = exc.value
+    assert err.request_id == "r-cap"
+    assert "DFlash reserved KV capacity exceeded" in err.message
+    assert err.details["required_tokens"] == 11
+    assert err.details["capacity_tokens"] == 10

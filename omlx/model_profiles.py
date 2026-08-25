@@ -96,6 +96,14 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "ttl_seconds",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
+        # Single-session KV capacity knobs: operational settings for a
+        # specialized deployment profile, set directly in model_settings.json;
+        # deliberately hidden from profiles/templates and the admin UI.
+        "dflash_kv_capacity_tokens",
+        "dflash_prefill_step_size",
+        "dflash_max_snapshot_tokens",
+        "dflash_session_base_reuse",
+        "dflash_session_base_min_tokens",
     }
 )
 

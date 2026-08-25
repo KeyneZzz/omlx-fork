@@ -2104,6 +2104,8 @@ def _completion_keepalive_chunk(response_id: str) -> str:
         '"model":"keepalive",'
         '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
+
+
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
@@ -3224,6 +3226,31 @@ async def create_completion(
             prompt_token_ids_by_prompt.append(prompt_token_ids)
             validate_context_window(len(prompt_token_ids), request.model)
 
+        (
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            min_p,
+            presence_penalty,
+            frequency_penalty,
+            max_tokens,
+            xtc_probability,
+            xtc_threshold,
+        ) = get_sampling_params(
+            request.temperature,
+            request.top_p,
+            request.model,
+            req_top_k=getattr(request, "top_k", None),
+            req_repetition_penalty=getattr(request, "repetition_penalty", None),
+            req_min_p=getattr(request, "min_p", None),
+            req_presence_penalty=getattr(request, "presence_penalty", None),
+            req_frequency_penalty=getattr(request, "frequency_penalty", None),
+            req_max_tokens=request.max_tokens,
+            req_xtc_probability=getattr(request, "xtc_probability", None),
+            req_xtc_threshold=getattr(request, "xtc_threshold", None),
+        )
+
         # Pre-flight prefill memory guard — see create_chat_completion for
         # the reason this must precede any StreamingResponse return.
         # Thread the client-provided X-Request-ID when present so the 400
@@ -3232,7 +3259,9 @@ async def create_completion(
         upstream_request_id = http_request.headers.get("x-request-id")
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+            await engine.preflight_completion(
+                prompt, request_id=upstream_request_id, max_tokens=max_tokens
+            )
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
@@ -3269,31 +3298,6 @@ async def create_completion(
             total_completion_tokens = 0
             total_prompt_tokens = 0
             total_cached_tokens = 0
-
-            (
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                min_p,
-                presence_penalty,
-                frequency_penalty,
-                max_tokens,
-                xtc_probability,
-                xtc_threshold,
-            ) = get_sampling_params(
-                request.temperature,
-                request.top_p,
-                request.model,
-                req_top_k=getattr(request, "top_k", None),
-                req_repetition_penalty=getattr(request, "repetition_penalty", None),
-                req_min_p=getattr(request, "min_p", None),
-                req_presence_penalty=getattr(request, "presence_penalty", None),
-                req_frequency_penalty=getattr(request, "frequency_penalty", None),
-                req_max_tokens=request.max_tokens,
-                req_xtc_probability=getattr(request, "xtc_probability", None),
-                req_xtc_threshold=getattr(request, "xtc_threshold", None),
-            )
 
             gen_kwargs = {}
             thinking_budget = _resolve_thinking_budget(request, request.model)
@@ -3344,11 +3348,11 @@ async def create_completion(
             )
 
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
@@ -3586,11 +3590,7 @@ async def create_chat_completion(
                 )
             tools_disabled = True
         effective_tools = None if tools_disabled else request.tools
-        if (
-            _server_state.mcp_manager
-            and not tools_disabled
-            and mcp_tools_exposed()
-        ):
+        if _server_state.mcp_manager and not tools_disabled and mcp_tools_exposed():
             # Convert Pydantic ToolDefinition models to dicts for merge_tools
             user_tools_dicts = (
                 [t.model_dump() for t in request.tools] if request.tools else None
@@ -3813,11 +3813,7 @@ async def create_chat_completion(
                 f"request_max_tokens={request.max_tokens}"
             )
             first_token_at = getattr(output, "first_token_at", None)
-            ttft = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
-            )
+            ttft = (first_token_at - start_time) if first_token_at is not None else 0.0
             gen_duration = elapsed - ttft if ttft > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
@@ -5251,9 +5247,7 @@ async def stream_anthropic_messages(
         # held newlines here, and pure whitespace must not open a
         # phantom text block.
         if remaining and not (
-            not text_block_started
-            and kwargs.get("tools")
-            and not remaining.strip()
+            not text_block_started and kwargs.get("tools") and not remaining.strip()
         ):
             if not text_block_started:
                 if thinking_block_started:
@@ -5726,11 +5720,11 @@ async def create_anthropic_message(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -6061,11 +6055,7 @@ async def create_response(
             )
             else openai_tools
         )
-        if (
-            _server_state.mcp_manager
-            and effective_tools
-            and mcp_tools_exposed()
-        ):
+        if _server_state.mcp_manager and effective_tools and mcp_tools_exposed():
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
 
         # Convert tools for chat template
@@ -6232,11 +6222,11 @@ async def create_response(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,

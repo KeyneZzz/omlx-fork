@@ -26,6 +26,9 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
+        assert settings.dflash_kv_capacity_tokens == 0
+        assert settings.dflash_prefill_step_size is None
+        assert settings.dflash_max_snapshot_tokens is None
         assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size == 0
         assert settings.dflash_block_size is None
@@ -54,6 +57,9 @@ class TestDFlashModelSettings:
         assert "dflash_draft_quant_activation_bits" not in d
         assert "dflash_draft_quant_group_size" not in d
         assert "dflash_max_ctx" not in d
+        assert d["dflash_kv_capacity_tokens"] == 0
+        assert "dflash_prefill_step_size" not in d
+        assert "dflash_max_snapshot_tokens" not in d
         assert "dflash_draft_window_size" not in d
         assert d["dflash_draft_sink_size"] == 0
         # Remaining tuning knobs default to None → omitted from on-disk JSON.
@@ -73,6 +79,9 @@ class TestDFlashModelSettings:
             "dflash_in_memory_cache_max_entries": 16,
             "dflash_in_memory_cache_max_bytes": 4 * 1024 * 1024 * 1024,
             "dflash_ssd_cache": True,
+            "dflash_kv_capacity_tokens": 163840,
+            "dflash_prefill_step_size": 512,
+            "dflash_max_snapshot_tokens": 0,
         }
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_enabled is True
@@ -86,6 +95,9 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 16
         assert settings.dflash_in_memory_cache_max_bytes == 4 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is True
+        assert settings.dflash_kv_capacity_tokens == 163840
+        assert settings.dflash_prefill_step_size == 512
+        assert settings.dflash_max_snapshot_tokens == 0
 
     def test_from_dict_missing_new_fields_uses_defaults(self):
         """Old settings.json without new fields should fall back to dataclass defaults."""
@@ -99,6 +111,9 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
+        assert settings.dflash_kv_capacity_tokens == 0
+        assert settings.dflash_prefill_step_size is None
+        assert settings.dflash_max_snapshot_tokens is None
         assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size == 0
 
@@ -118,12 +133,18 @@ class TestDFlashModelSettings:
             "dflash_enabled": True,
             "dflash_draft_window_size": 2048,
             "dflash_draft_sink_size": 32,
+            "dflash_kv_capacity_tokens": 163840,
+            "dflash_prefill_step_size": 512,
+            "dflash_max_snapshot_tokens": 0,
             "dflash_block_size": 5,
             "dflash_verify_mode": "adaptive",
         }
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_draft_window_size == 2048
         assert settings.dflash_draft_sink_size == 32
+        assert settings.dflash_kv_capacity_tokens == 163840
+        assert settings.dflash_prefill_step_size == 512
+        assert settings.dflash_max_snapshot_tokens == 0
         assert settings.dflash_block_size == 5
         assert settings.dflash_verify_mode == "adaptive"
 
@@ -139,6 +160,9 @@ class TestDFlashModelSettings:
             dflash_in_memory_cache=False,
             dflash_ssd_cache=False,
             dflash_ssd_cache_max_bytes=30 * 1024**3,
+            dflash_kv_capacity_tokens=163840,
+            dflash_prefill_step_size=512,
+            dflash_max_snapshot_tokens=0,
         )
         d = original.to_dict()
         restored = ModelSettings.from_dict(d)
@@ -164,6 +188,11 @@ class TestDFlashModelSettings:
         assert restored.dflash_ssd_cache == original.dflash_ssd_cache
         assert (
             restored.dflash_ssd_cache_max_bytes == original.dflash_ssd_cache_max_bytes
+        )
+        assert restored.dflash_kv_capacity_tokens == original.dflash_kv_capacity_tokens
+        assert restored.dflash_prefill_step_size == original.dflash_prefill_step_size
+        assert (
+            restored.dflash_max_snapshot_tokens == original.dflash_max_snapshot_tokens
         )
 
 
@@ -712,6 +741,8 @@ class TestDFlashEngineInit:
             model_name="test-model",
             draft_model_path="test-draft",
             model_settings=ModelSettings(
+                dflash_prefill_step_size=512,
+                dflash_max_snapshot_tokens=0,
                 dflash_draft_window_size=512,
                 dflash_draft_sink_size=16,
                 dflash_verify_mode="dflash",
@@ -719,6 +750,8 @@ class TestDFlashEngineInit:
         )
         ctx = engine._build_runtime_context()
         runtime = ctx.runtime
+        assert runtime.prefill_step_size == 512
+        assert runtime.max_snapshot_tokens == 0
         assert runtime.draft_window_size == 512
         assert runtime.draft_sink_size == 16
         assert runtime.verify_mode == "dflash"
@@ -1838,9 +1871,7 @@ class TestSpeculationStats:
         assert totals["speculative_requests"] == 2
         assert 0.0 < totals["acceptance_ratio"] < 1.0
         assert totals["tokens_per_cycle"] == (768 + 1371) / (377 + 666)
-        assert totals["accepted_draft_tokens_per_cycle"] == (391 + 705) / (
-            377 + 666
-        )
+        assert totals["accepted_draft_tokens_per_cycle"] == (391 + 705) / (377 + 666)
 
     def test_uses_runtime_exact_counters_not_reconstructed_values(self):
         engine = self._engine()

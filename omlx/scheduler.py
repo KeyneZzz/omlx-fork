@@ -1519,7 +1519,7 @@ class SchedulerConfig:
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+    mlx_cache_cleanup_interval: int = 16  # Steps between mx.clear_cache() calls
 
 
 @dataclass
@@ -2252,7 +2252,7 @@ class Scheduler:
         is already small.
         """
         if self._memory_limit_bytes > 0:
-            return max(self._memory_limit_bytes // 3, 2 * 1024**3)
+            return max(self._memory_limit_bytes // 16, 1 * 1024**3)
         return 2 * 1024**3
 
     def _should_periodic_clear_cache(self) -> bool:

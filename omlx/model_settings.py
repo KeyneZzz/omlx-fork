@@ -74,6 +74,8 @@ def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
     resolved = dict(data)
     resolved["vlm_mtp_enabled"] = False
     return resolved, conflicts
+
+
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -137,6 +139,18 @@ class ModelSettings:
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
+        dflash_kv_capacity_tokens: Fixed DFlash KV capacity to reserve on first
+            cache use (0 = stock incremental growth).
+        dflash_prefill_step_size: DFlash prefill chunk size override
+            (None = dflash default).
+        dflash_max_snapshot_tokens: DFlash prefix snapshot token cap
+            (None = dflash default; 0 disables the cap).
+        dflash_session_base_reuse: Reuse the shared system prefix (system
+            prompt + tool definitions) across sessions by warming an exact
+            boundary snapshot; new sessions resume prefill from it instead
+            of re-prefilling everything. Capacity-mode only.
+        dflash_session_base_min_tokens: Minimum shared-prefix length to
+            warm/serve a session base (shorter prefixes re-prefill).
         dflash_draft_window_size: Draft model sliding-attention window
             (None = use the draft checkpoint's sliding_window when present).
             Helps stabilise acceptance rate on long-context prompts.
@@ -258,6 +272,13 @@ class ModelSettings:
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
     # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
     # sliding_window when present; sink size defaults to no attention-sink tokens.
+    dflash_kv_capacity_tokens: int = 0
+    dflash_prefill_step_size: Optional[int] = None
+    dflash_max_snapshot_tokens: Optional[int] = None
+    # Cross-session reuse of the shared system prefix (see
+    # omlx.patches.dflash_session_base). Capacity-mode only.
+    dflash_session_base_reuse: bool = True
+    dflash_session_base_min_tokens: int = 1024
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = 0
     dflash_block_size: Optional[int] = None

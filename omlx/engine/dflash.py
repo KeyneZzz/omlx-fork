@@ -28,6 +28,7 @@ from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.observability import CacheRateTracker
+from ..exceptions import PrefillMemoryExceededError
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
@@ -46,6 +47,35 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _nonnegative_int(value: Any, *, default: int = 0) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _nonnegative_int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
@@ -129,9 +159,7 @@ def _format_phase_timings(phase_timings_us: object) -> str:
 # Precision suffixes Poolside uses for drafts trained against a quantized
 # target ("Laguna-S-2.1-DFlash-NVFP4" etc.). Anything else after "-DFlash-"
 # (e.g. z-lab's "-b16" block-size suffix) makes no precision claim.
-_DRAFT_PRECISION_TAGS = frozenset(
-    {"NVFP4", "INT4", "INT8", "FP8", "FP4", "MXFP4"}
-)
+_DRAFT_PRECISION_TAGS = frozenset({"NVFP4", "INT4", "INT8", "FP8", "FP4", "MXFP4"})
 
 
 def _canonical_precision_tag(value: object) -> str | None:
@@ -264,11 +292,13 @@ class _DFlashPrefillGuard:
         self,
         *,
         num_prompt_tokens: int,
+        cached_tokens: int = 0,
         request_id: str | None = None,
     ) -> None:
-        # Deliberately no cached_tokens parameter: a DFlash prefix-cache hit
-        # reconstructs the matched KV into active memory, so the full prompt
-        # must always be charged (see DFlashEngine.preflight_chat).
+        # cached_tokens = prompt KV already resident in the *live* target
+        # cache (agent-style continuation); see DFlashEngine.preflight_chat.
+        # Snapshot-hit reconstruction must pass 0 — the engine wrapper owns
+        # that distinction.
         raise_if_prefill_exceeds(
             self.memory_monitor,
             prefill_memory_guard=self._prefill_memory_guard,
@@ -276,6 +306,7 @@ class _DFlashPrefillGuard:
             current_usage_bytes=self._current_usage_bytes(),
             prefill_step_size=self._prefill_step_size,
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
             static_ceiling_bytes=self._memory_static_ceiling_bytes,
             dynamic_ceiling_bytes=self._memory_dynamic_ceiling_bytes,
@@ -336,6 +367,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._executor_tokenizer = None
         self._loaded = False
         self._active_request = False
+        # Prompt tokens currently resident in the live target cache (last
+        # completed request's prompt + generated). Credited by preflight as
+        # cached_tokens: that KV already sits inside current usage and is
+        # reused in place by agent-style continuation; any new conversation
+        # replaces it, so the credit stays exact in both cases. Cleared on
+        # cancellation and teardown so it never goes stale.
+        self._resident_cache_tokens = 0
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
@@ -418,6 +456,39 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else None
         )
+        self._kv_capacity_tokens = _nonnegative_int(
+            getattr(model_settings, "dflash_kv_capacity_tokens", 0)
+            if model_settings
+            else 0
+        )
+        self._dflash_prefill_step_size = _positive_int_or_none(
+            getattr(model_settings, "dflash_prefill_step_size", None)
+            if model_settings
+            else None
+        )
+        self._dflash_max_snapshot_tokens = _nonnegative_int_or_none(
+            getattr(model_settings, "dflash_max_snapshot_tokens", None)
+            if model_settings
+            else None
+        )
+        self._session_base_reuse = (
+            bool(getattr(model_settings, "dflash_session_base_reuse", True))
+            if model_settings
+            else True
+        )
+        self._session_base_min_tokens = max(
+            0,
+            int(
+                getattr(model_settings, "dflash_session_base_min_tokens", 1024)
+                if model_settings
+                else 1024
+            ),
+        )
+        # Session-base warmup bookkeeping (see _maybe_warm_session_base).
+        self._session_base_marker_ids: tuple[int | None, int | None] | None = None
+        self._session_base_candidate: tuple[int, ...] | None = None
+        self._session_base_candidate_seen = 0
+        self._in_session_base_warmup = False
 
     @property
     def model_name(self) -> str:
@@ -477,10 +548,31 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         l2_dir = self._resolve_dflash_l2_dir()
         l2_enabled = l2_dir is not None
+        l1_max_bytes = self._in_memory_cache_max_bytes
+        if self._kv_capacity_tokens > 0:
+            # Capacity-backed snapshots carry *physical* capacity arrays
+            # (adopted zero-copy by the dflash_kv_prealloc patches), not
+            # logical-length prefixes: a 160K reservation reports ~11GB of
+            # fa_kv where the logical prefix may be a fraction of that.
+            # Without this floor the default 8GiB budget self-evicts the
+            # just-inserted generation snapshot (sole entry over budget) and
+            # the next turn pays a full re-prefill. 80KB/token covers target
+            # FA KV (64KB) plus GDN/draft-context slack.
+            #
+            # The budget must hold THREE such snapshots: the session-base
+            # prefill snapshot plus the latest generation snapshot, or
+            # dflash's _incoming_generation_should_yield_to_prefill drops
+            # every generation snapshot while the base is resident and
+            # same-session turns re-prefill the whole conversation tail.
+            # All capacity-adopted snapshots alias one physical buffer, so
+            # the extra accounting headroom costs no real memory.
+            l1_max_bytes = max(
+                l1_max_bytes, int(self._kv_capacity_tokens) * 80 * 1024 * 3
+            )
         cfg = runtime_config_from_defaults(
             prefix_cache=self._in_memory_cache_enabled,
             prefix_cache_max_entries=self._in_memory_cache_max_entries,
-            prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
+            prefix_cache_max_bytes=l1_max_bytes,
             prefix_cache_l2=l2_enabled,
             prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",
             # Per-model L2 disk budget. dflash-mlx's _evict_to_budget drops the
@@ -488,6 +580,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # stays bounded instead of filling the disk (issue #1326).
             prefix_cache_l2_max_bytes=self._ssd_cache_max_bytes if l2_enabled else 0,
             # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
+            prefill_step_size=self._dflash_prefill_step_size,
+            max_snapshot_tokens=self._dflash_max_snapshot_tokens,
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
@@ -623,6 +717,27 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._target_ops = target_bundle.target_ops
         target_meta = target_bundle.meta
 
+        if self._kv_capacity_tokens > 0:
+            try:
+                from ..patches.dflash_kv_prealloc import install_dflash_kv_prealloc
+
+                install_dflash_kv_prealloc(self._kv_capacity_tokens)
+            except Exception as exc:
+                logger.warning(f"DFlash KV prealloc patch install failed: {exc}")
+            if self._session_base_reuse:
+                try:
+                    from ..patches import dflash_session_base
+
+                    if dflash_session_base.install():
+                        logger.info(
+                            "DFlash session-base reuse armed (min %d tokens)",
+                            self._session_base_min_tokens,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"DFlash session-base patch install failed: {exc}"
+                    )
+
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
         # (encode, apply_chat_template, count_chat_tokens).
@@ -680,10 +795,24 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     max_kv_cache_memory=None, eviction_enabled=False
                 )
                 set_model_info_from_model(monitor, self._target_model)
-                step = (
+                runtime_cfg = getattr(self._runtime_context, "runtime", None)
+                step = getattr(runtime_cfg, "prefill_step_size", None) or (
                     getattr(self._scheduler_config, "prefill_step_size", 2048) or 2048
                 )
                 self._prefill_guard = _DFlashPrefillGuard(monitor, step)
+                if self._kv_capacity_tokens > 0:
+                    target_kv_bytes = monitor.estimate_resident_kv_bytes(
+                        self._kv_capacity_tokens
+                    )
+                    logger.info(
+                        "DFlash KV prealloc enabled: capacity=%d tokens, "
+                        "target_kv_estimate=%.2fGB, prefill_step=%s, "
+                        "max_snapshot_tokens=%s",
+                        self._kv_capacity_tokens,
+                        target_kv_bytes / 1024**3,
+                        step,
+                        getattr(runtime_cfg, "max_snapshot_tokens", None),
+                    )
             except Exception as exc:
                 # Warn (not debug): a missing guard silently disables the
                 # prefill OOM protection this engine relies on.
@@ -700,6 +829,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         window_used = getattr(runtime_cfg, "draft_window_size", "?")
         sink_used = getattr(runtime_cfg, "draft_sink_size", "?")
         verify_used = getattr(runtime_cfg, "verify_mode", "?")
+        prefill_step_used = getattr(runtime_cfg, "prefill_step_size", "?")
+        max_snapshot_used = getattr(runtime_cfg, "max_snapshot_tokens", "?")
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
@@ -707,6 +838,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             f"fallback={self._fallback_engine_type}, "
             f"l1_cache={self._in_memory_cache_enabled}, "
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
+            f"kv_capacity={self._kv_capacity_tokens}, "
+            f"prefill_step={prefill_step_used}, "
+            f"max_snapshot_tokens={max_snapshot_used}, "
             f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
         )
 
@@ -767,6 +901,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # Release dflash model and cache references
         shutdown_runtime_cache_manager()
         self._dflash_prefix_cache = None
+        self._resident_cache_tokens = 0
         self._runtime_context = None
         self._target_model = None
         self._target_ops = None
@@ -791,6 +926,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             restore_dflash_class_patches()
         except Exception as exc:
             logger.debug(f"restore_dflash_class_patches (evict): {exc}")
+        try:
+            from ..patches.dflash_kv_prealloc import restore_dflash_kv_prealloc
+
+            restore_dflash_kv_prealloc()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_kv_prealloc (evict): {exc}")
+        try:
+            from ..patches.dflash_session_base import restore as restore_session_base
+
+            restore_session_base()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_session_base (evict): {exc}")
 
         # Force memory reclaim with settle barrier
         gc.collect()
@@ -850,6 +997,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         except Exception as exc:
             logger.debug(f"shutdown_runtime_cache_manager: {exc}")
         self._dflash_prefix_cache = None
+        self._resident_cache_tokens = 0
         self._runtime_context = None
         self._target_model = None
         self._target_ops = None
@@ -870,6 +1018,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             restore_dflash_class_patches()
         except Exception as exc:
             logger.debug(f"restore_dflash_class_patches: {exc}")
+        try:
+            from ..patches.dflash_kv_prealloc import restore_dflash_kv_prealloc
+
+            restore_dflash_kv_prealloc()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_kv_prealloc: {exc}")
+        try:
+            from ..patches.dflash_session_base import restore as restore_session_base
+
+            restore_session_base()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_session_base: {exc}")
         logger.info("DFlashEngine stopped")
 
     def _apply_chat_template(
@@ -957,6 +1117,37 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         )
         return len(self._tokenizer_obj.encode(prompt))
 
+    def _preflight_kv_capacity_or_raise(
+        self,
+        *,
+        num_prompt_tokens: int,
+        max_tokens: int | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        capacity = int(getattr(self, "_kv_capacity_tokens", 0) or 0)
+        if capacity <= 0:
+            return
+        prompt_tokens = max(0, int(num_prompt_tokens or 0))
+        generation_tokens = _nonnegative_int(max_tokens, default=0)
+        required = prompt_tokens + generation_tokens
+        if required <= capacity:
+            return
+        raise PrefillMemoryExceededError(
+            message=(
+                f"DFlash reserved KV capacity exceeded: request needs {required} "
+                f"tokens (prompt={prompt_tokens}, max_tokens={generation_tokens}) "
+                f"but capacity is {capacity}. Increase "
+                f"dflash_kv_capacity_tokens or lower max_tokens/context."
+            ),
+            request_id=request_id,
+            details={
+                "prompt_tokens": prompt_tokens,
+                "max_tokens": generation_tokens,
+                "required_tokens": required,
+                "capacity_tokens": capacity,
+            },
+        )
+
     async def preflight_chat(
         self,
         messages: list,
@@ -980,11 +1171,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 messages, tools=tools, request_id=request_id, **kwargs
             )
             return
-        if self._prefill_guard is None:
-            _warn_scheduler_unreachable_once(
-                self, "preflight_chat", "primary-mode prefill guard unavailable"
-            )
-            return
         try:
             num_tokens = self.count_chat_tokens(
                 messages,
@@ -999,14 +1185,33 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 type(e).__name__,
             )
             return
-        # Deliberately no cached_tokens: a DFlash prefix-cache hit
-        # *reconstructs* the matched KV into active memory (dflash_mlx
-        # ``hydrate_target_cache`` clones every array), so the full prompt's
-        # KV is allocated this request — unlike the scheduler's resident
-        # paged cache. Subtracting hit tokens here would under-count and
-        # defeat the OOM guard.
+        self._preflight_kv_capacity_or_raise(
+            num_prompt_tokens=num_tokens,
+            max_tokens=kwargs.get("max_tokens"),
+            request_id=request_id,
+        )
+        if self._prefill_guard is None:
+            _warn_scheduler_unreachable_once(
+                self, "preflight_chat", "primary-mode prefill guard unavailable"
+            )
+            return
+        # Agent-turn admission credit: prompt KV already resident in the live
+        # target cache is counted inside current usage AND reused in place by
+        # the continuation path, so only the delta is charged. Safe for cold
+        # paths too — a snapshot hit or new conversation replaces the resident
+        # cache, whose bytes the credit subtracts exactly once (never under-
+        # counting the post-replacement state). Reset on cancel/teardown.
+        # Capacity mode only: stock DFlash hydrates snapshots into fresh KV
+        # during the request, so upstream charges the full prompt there.
+        resident = (
+            getattr(self, "_resident_cache_tokens", 0)
+            if self._kv_capacity_tokens > 0
+            else 0
+        )
         self._prefill_guard.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+            num_prompt_tokens=num_tokens,
+            cached_tokens=min(resident, num_tokens),
+            request_id=request_id,
         )
 
     async def preflight_completion(
@@ -1023,13 +1228,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 prompt, request_id=request_id, **kwargs
             )
             return
-        if self._prefill_guard is None:
-            _warn_scheduler_unreachable_once(
-                self,
-                "preflight_completion",
-                "primary-mode prefill guard unavailable",
-            )
-            return
         try:
             num_tokens = len(self._tokenizer_obj.encode(prompt))
         except Exception as e:
@@ -1040,11 +1238,28 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 type(e).__name__,
             )
             return
-        # Deliberately no cached_tokens — see preflight_chat: a prefix-cache
-        # hit reconstructs KV into active memory, so the full prompt is
-        # charged.
+        self._preflight_kv_capacity_or_raise(
+            num_prompt_tokens=num_tokens,
+            max_tokens=kwargs.get("max_tokens"),
+            request_id=request_id,
+        )
+        if self._prefill_guard is None:
+            _warn_scheduler_unreachable_once(
+                self,
+                "preflight_completion",
+                "primary-mode prefill guard unavailable",
+            )
+            return
+        # Live-residency credit — see preflight_chat (capacity mode only).
+        resident = (
+            getattr(self, "_resident_cache_tokens", 0)
+            if self._kv_capacity_tokens > 0
+            else 0
+        )
         self._prefill_guard.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+            num_prompt_tokens=num_tokens,
+            cached_tokens=min(resident, num_tokens),
+            request_id=request_id,
         )
 
     @property
@@ -1131,6 +1346,118 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tag = getattr(self._tokenizer_obj, "think_start", "<think>")
         return f"{tag}\n"
 
+    def _resolve_session_base_marker(self) -> tuple[int | None, int | None]:
+        """Resolve the (<|im_start|>, user) marker token ids once.
+
+        Mirrors dflash's chat_template_stable_marker detection; (None, None)
+        disables the feature for tokenizers without the markers.
+        """
+        if self._session_base_marker_ids is not None:
+            return self._session_base_marker_ids
+        marker: tuple[int | None, int | None] = (None, None)
+        try:
+            tokenizer = self._executor_tokenizer
+            convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+            if callable(convert):
+                ids = convert(["<|im_start|>", "user"])
+                unk = getattr(tokenizer, "unk_token_id", None)
+                if (
+                    isinstance(ids, (list, tuple))
+                    and len(ids) >= 2
+                    and ids[0] is not None
+                    and ids[1] is not None
+                    and ids[0] != unk
+                    and ids[1] != unk
+                ):
+                    marker = (int(ids[0]), int(ids[1]))
+        except Exception as exc:
+            logger.debug("session-base marker resolution failed: %s", exc)
+        self._session_base_marker_ids = marker
+        return marker
+
+    def _first_user_boundary(self, prompt_tokens: list[int]) -> int:
+        """Token count before the first user turn (0 when absent).
+
+        Scanning from the front is safe: marker ids crafted inside user
+        content sit after the first real user turn, so they can only make
+        the boundary earlier — a shorter but still valid base.
+        """
+        im_start, user = self._resolve_session_base_marker()
+        if im_start is None or user is None:
+            return 0
+        for i in range(len(prompt_tokens) - 1):
+            if prompt_tokens[i] == im_start and prompt_tokens[i + 1] == user:
+                return i
+        return 0
+
+    def _maybe_warm_session_base(
+        self,
+        prompt_tokens: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        min_p: float,
+    ) -> None:
+        """Warm a session base for the shared system prefix when needed.
+
+        The warmup runs a real ``max_tokens=1`` generation over exactly the
+        shared prefix with generation-snapshot publishing suppressed — that
+        flips the runtime's publish gate so a prefill snapshot is published
+        at the turn boundary (the only way to materialize GDN recurrent
+        states + logits at that position, at any prefix length, instead of
+        relying on dflash's 4096-token sidecar threshold). Replacing an
+        existing base requires seeing the new prefix on two consecutive
+        requests, so alternating tool sets degrade to plain full re-prefill
+        instead of thrashing the base. The warmup consumes RNG state;
+        requests that need bit-exact reproducibility should disable
+        dflash_session_base_reuse.
+        """
+        from ..patches import dflash_session_base
+
+        boundary = self._first_user_boundary(prompt_tokens)
+        if boundary < max(0, int(getattr(self, "_session_base_min_tokens", 1024))):
+            return
+        prefix = tuple(prompt_tokens[:boundary])
+        if dflash_session_base.active_base_prefix() == prefix:
+            return  # the lookup wrapper serves it as a synthetic hit
+        if dflash_session_base.active_base_prefix() is not None:
+            if self._session_base_candidate != prefix:
+                self._session_base_candidate = prefix
+                self._session_base_candidate_seen = 1
+                return
+            self._session_base_candidate_seen += 1
+            if self._session_base_candidate_seen < 2:
+                return
+        self._session_base_candidate = None
+        self._session_base_candidate_seen = 0
+
+        logger.info(
+            "DFlash session base warmup: prefilling %d shared prefix tokens "
+            "(one-time; later session switches resume from here)",
+            boundary,
+        )
+        self._in_session_base_warmup = True
+        dflash_session_base.arm_capture(prefix)
+        try:
+            event_iter, _flow, _stop_ids = self._stream_dflash_events(
+                prompt_tokens=list(prefix),
+                max_tokens=1,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                suppress_generation_snapshot=True,
+            )
+            for _event in event_iter:
+                pass
+        except Exception as exc:
+            logger.warning("DFlash session base warmup failed: %s", exc)
+        finally:
+            dflash_session_base.disarm_capture()
+            self._in_session_base_warmup = False
+
     def _stream_dflash_events(
         self,
         prompt_tokens: list[int],
@@ -1139,10 +1466,31 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         top_p: float = 1.0,
         top_k: int = 0,
         min_p: float = 0.0,
+        suppress_generation_snapshot: bool = False,
     ):
-        """Build the dflash event iterator with prefix cache plumbed in."""
+        """Build the dflash event iterator with prefix cache plumbed in.
+
+        ``suppress_generation_snapshot`` (session-base warmup only) stops
+        the end-of-request generation snapshot so the runtime keeps its
+        prefill-snapshot publish gate open — the warmup needs the prefill
+        snapshot published at the turn boundary.
+        """
         from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
+
+        if (
+            not getattr(self, "_in_session_base_warmup", False)
+            and int(getattr(self, "_kv_capacity_tokens", 0) or 0) > 0
+            and getattr(self, "_session_base_reuse", True)
+        ):
+            self._maybe_warm_session_base(
+                prompt_tokens,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+            )
 
         stop_ids = get_stop_token_ids(self._executor_tokenizer)
 
@@ -1190,7 +1538,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             snapshot_service=prefix_flow.snapshot_service,
             stable_prefix_len=prefix_flow.stable_prefix_len,
             prefix_cache_active=prefix_flow.cache_active,
-            publish_generation_snapshot=prefix_flow.publish_generation_snapshot,
+            publish_generation_snapshot=(
+                prefix_flow.publish_generation_snapshot
+                and not suppress_generation_snapshot
+            ),
             prefix_hit_kind=str(getattr(prefix_flow, "hit_kind", "miss") or "miss"),
             runtime_context=self._runtime_context,
         )
@@ -1445,6 +1796,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 **kwargs,
             )
 
+        self._preflight_kv_capacity_or_raise(
+            num_prompt_tokens=len(prompt_tokens),
+            max_tokens=max_tokens,
+            request_id=kwargs.get("request_id"),
+        )
+
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
 
@@ -1546,6 +1903,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             except asyncio.CancelledError:
                 stop_event.set()
                 logger.info("DFlash generate cancelled, waiting for executor to drain")
+                # Partial/unknown prefill state: drop the residency credit.
+                self._resident_cache_tokens = 0
                 try:
                     await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
                 except TimeoutError:
@@ -1579,6 +1938,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # themselves and prepending would double the marker.
             if self._detect_needs_think_prefix(prompt_tokens):
                 text = self._think_prefix_text() + text
+
+        # Live target cache now holds prompt + generated tokens; the next
+        # request's preflight credits this residency (delta admission).
+        self._resident_cache_tokens = len(prompt_tokens) + len(generated)
 
         prompt_token_count = (
             int(summary.prompt_token_count)
@@ -1666,6 +2029,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 yield output
             return
 
+        self._preflight_kv_capacity_or_raise(
+            num_prompt_tokens=len(prompt_tokens),
+            max_tokens=max_tokens,
+            request_id=kwargs.get("request_id"),
+        )
+
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
 
@@ -1735,6 +2104,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else:
                         finish_reason = (metrics or {}).get("finish_reason", "stop")
                     finished_normally = True
+                    # Live target cache now holds prompt + generated tokens.
+                    self._resident_cache_tokens = prompt_len + total_completion
 
                 yield GenerationOutput(
                     text=total_text,
@@ -1764,6 +2135,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if not finished_normally:
                 stop_event.set()
                 logger.info("DFlash stream cancelled, waiting for executor to drain")
+                # Partial/unknown prefill state: drop the residency credit.
+                self._resident_cache_tokens = 0
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
             except TimeoutError:
